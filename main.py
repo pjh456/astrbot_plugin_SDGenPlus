@@ -41,6 +41,7 @@ class SDGenerator(Star):
         super().__init__(context)
         self.config = config
         self.session = None
+        self._session_lock = asyncio.Lock()
         self._validate_config()
         os.makedirs(TEMP_PATH, exist_ok=True)
 
@@ -81,11 +82,12 @@ class SDGenerator(Star):
             logger.debug(f"暂无法在启动时构建词库向量索引: {e}")
 
     def _cancel_embedding_build(self):
-        """取消正在进行的后台构建任务（切换提供商/手动重建时用）。"""
+        """取消正在进行的后台构建任务，并返回原任务供调用方等待收尾。"""
         task = self._embed_build_task
         self._embed_build_task = None
         if task is not None and not task.done():
             task.cancel()
+        return task
 
     def _distribute_bundled_vocab(self):
         """若目标词库文件不存在，则把插件自带的 prompt_vocabulary.txt 复制过去"""
@@ -130,11 +132,39 @@ class SDGenerator(Star):
             self.config.save_config()
 
     async def ensure_session(self):
-        """确保会话连接"""
-        if self.session is None or self.session.closed:
-            self.session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(self.config.get("session_timeout_time", 120))
-            )
+        """确保共享 HTTP 会话可用，避免并发请求重复创建连接池。"""
+        if self.session is not None and not self.session.closed:
+            return self.session
+        async with self._session_lock:
+            if self.session is None or self.session.closed:
+                timeout = max(10, int(self.config.get("session_timeout_time", 120)))
+                self.session = aiohttp.ClientSession(
+                    timeout=aiohttp.ClientTimeout(total=timeout)
+                )
+        return self.session
+
+    async def terminate(self):
+        """插件卸载时释放后台任务、HTTP 会话与兼容 embedding 客户端。"""
+        task = self._cancel_embedding_build()
+        if task is not None:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.debug(f"等待词库索引任务结束时出现异常: {e}")
+
+        if self.session is not None and not self.session.closed:
+            await self.session.close()
+        self.session = None
+
+        if self._embed_client is not None:
+            try:
+                await self._embed_client.close()
+            except Exception as e:
+                logger.debug(f"关闭 embedding 客户端失败: {e}")
+        self._embed_client = None
+        self._embed_client_key = None
 
     async def _fetch_webui_resource(self, resource_type: str) -> list:
         """从 WebUI API 获取指定类型的资源列表"""
@@ -354,6 +384,18 @@ class SDGenerator(Star):
             logger.error(f"读取标准词库文件失败: {e}")
             return ""
 
+    def _vocab_mtime(self) -> float | None:
+        """返回当前词库文件 mtime，用于内存索引与向量缓存失效判断。"""
+        path = (self.config.get("prompt_vocabulary_path") or "").strip()
+        if not path:
+            return None
+        if not os.path.isabs(path):
+            path = os.path.abspath(path)
+        try:
+            return os.path.getmtime(path)
+        except OSError:
+            return None
+
     def _get_vocab_index(self) -> list:
         """获取解析后的词库条目列表，带内存缓存（按文件 mtime 自动失效）。返回 [(title, content), ...]"""
         path = (self.config.get("prompt_vocabulary_path") or "").strip()
@@ -361,12 +403,7 @@ class SDGenerator(Star):
             self._vocab_index = []
             self._vocab_index_mtime = None
             return self._vocab_index
-        if not os.path.isabs(path):
-            path = os.path.abspath(path)
-        try:
-            mtime = os.path.getmtime(path) if os.path.exists(path) else None
-        except Exception:
-            mtime = None
+        mtime = self._vocab_mtime()
         if self._vocab_index is not None and self._vocab_index_mtime == mtime:
             return self._vocab_index
         text = self._vocab_raw_text()
@@ -655,13 +692,7 @@ class SDGenerator(Star):
                 self._embed_last_try = time.time()
                 return
             provider_key = self._embedding_provider_key(provider, api_base, model)
-            path = (self.config.get("prompt_vocabulary_path") or "").strip()
-            if not os.path.isabs(path):
-                path = os.path.abspath(path)
-            try:
-                mtime = os.path.getmtime(path)
-            except OSError:
-                mtime = None
+            mtime = self._vocab_mtime()
             # 命中缓存则直接加载（校验提供商/模型/词库 mtime/条目数）
             if not force:
                 cache = self._load_embedding_cache()
@@ -673,6 +704,7 @@ class SDGenerator(Star):
                         self._embed_data = {
                             "entries": cache["entries"],
                             "vectors": self._normalize_vectors(vectors),
+                            "provider_key": provider_key,
                             "model": model,
                             "api_base": api_base,
                             "mtime": mtime,
@@ -696,6 +728,7 @@ class SDGenerator(Star):
                 self._embed_data = {
                     "entries": entries,
                     "vectors": norm_vectors,
+                    "provider_key": provider_key,
                     "model": model,
                     "api_base": api_base,
                     "mtime": mtime,
@@ -716,7 +749,14 @@ class SDGenerator(Star):
                 logger.info(f"词库向量索引构建完成: {len(entries)} 条, 维度 {dim}, 耗时 {time.time() - started:.1f}s")
                 self._embed_state = "ready"
                 self._embed_last_try = time.time()
+            except asyncio.CancelledError:
+                self._embed_data = None
+                self._embed_state = "idle"
+                self._embed_error = None
+                logger.info("词库向量索引构建已取消")
+                raise
             except Exception as e:
+                self._embed_data = None
                 self._embed_state = "error"
                 self._embed_error = str(e)
                 self._embed_last_try = time.time()
@@ -764,6 +804,26 @@ class SDGenerator(Star):
         """根据用户描述用 embedding 余弦相似度检索词库片段，返回拼好的字符串（无命中返回空）。"""
         if not self.config.get("embedding_enabled", True):
             return ""
+        provider, api_base, _ = self._get_embedding_provider()
+        if provider is None:
+            self._embed_state = "error"
+            self._embed_data = None
+            self._embed_error = "未找到可用的 embedding 提供商"
+            return ""
+        model = self._resolve_embedding_model(provider)
+        current_provider_key = self._embedding_provider_key(provider, api_base, model)
+        index_stale = (
+            self._embed_state == "ready"
+            and self._embed_data is not None
+            and (
+                self._embed_data.get("provider_key") != current_provider_key
+                or self._embed_data.get("mtime") != self._vocab_mtime()
+                or len(self._embed_data.get("entries", [])) != len(self._get_vocab_index())
+            )
+        )
+        if index_stale:
+            self._embed_state = "idle"
+            self._embed_data = None
         if self._embed_state != "ready":
             # 未就绪时确保有后台任务在构建，本次不阻塞生图、不注入词库
             if self._embed_build_task is None or self._embed_build_task.done():
@@ -780,9 +840,9 @@ class SDGenerator(Star):
         qv = await self._embed_one(query)
         if not qv:
             return ""
-        top_k = int(self.config.get("prompt_vocabulary_top_k", 8))
-        max_chars = int(self.config.get("prompt_vocabulary_max_chars", 4000))
-        hits = self._top_similar(qv[0], top_k)
+        top_k = max(1, int(self.config.get("prompt_vocabulary_top_k", 8)))
+        max_chars = max(1, int(self.config.get("prompt_vocabulary_max_chars", 4000)))
+        hits = self._top_similar(qv, top_k)
         entries = self._embed_data["entries"]
         snippets = []
         total = 0
@@ -829,18 +889,20 @@ class SDGenerator(Star):
 
     async def _call_sd_api(self, endpoint: str, payload: dict) -> dict:
         """通用API调用函数"""
-        await self.ensure_session()
         try:
-            async with self.session.post(
+            session = await self.ensure_session()
+            async with session.post(
                     f"{self.config['webui_url']}{endpoint}",
                     json=payload
             ) as resp:
                 if resp.status != 200:
-                    error = await resp.text()
+                    error = (await resp.text())[:1000]
                     raise ConnectionError(f"API错误 ({resp.status}): {error}")
                 return await resp.json()
+        except asyncio.TimeoutError as e:
+            raise TimeoutError("Stable Diffusion WebUI 请求超时") from e
         except aiohttp.ClientError as e:
-            raise ConnectionError(f"连接失败: {str(e)}")
+            raise ConnectionError(f"连接失败: {e}") from e
 
     async def _call_t2i_api(self, prompt: str) -> dict:
         """调用 Stable Diffusion 文生图 API"""
@@ -878,7 +940,8 @@ class SDGenerator(Star):
     async def _set_model(self, model_name: str) -> bool:
         """设置图像生成模型，并存入 config"""
         try:
-            async with self.session.post(
+            session = await self.ensure_session()
+            async with session.post(
                     f"{self.config['webui_url']}/sdapi/v1/options",
                     json={"sd_model_checkpoint": model_name}
             ) as resp:
@@ -1022,8 +1085,7 @@ class SDGenerator(Star):
 
                     image_data = response["images"][0]
 
-                    image_bytes = base64.b64decode(image_data)
-                    image = base64.b64encode(image_bytes).decode("utf-8")
+                    image = image_data
 
                     # 图像处理
                     if self.config.get("enable_upscale"):
@@ -1039,8 +1101,7 @@ class SDGenerator(Star):
                         yield event.plain_result("🖼️ 处理图像阶段，即将结束...")
 
                     for image_data in images:
-                        image_bytes = base64.b64decode(image_data)
-                        image = base64.b64encode(image_bytes).decode("utf-8")
+                        image = image_data
 
                         # 图像处理
                         if self.config.get("enable_upscale"):
@@ -1436,7 +1497,10 @@ class SDGenerator(Star):
             "- `/sd upscale`：切换图像增强模式（用于超分辨率放大或高分修复）。",
             "- `/sd LLM`：开启后，在使用/sd gen指令时，将内容先发送给LLM，再由LLM来生成正面提示词",
             "- `/sd prompt`：开启时，用户发起AI生图请求后，将发送一条消息，内容为送入到Stable diffusion的正面提示词",
-            "- `/sd vocab`：查看标准词库状态；附带查询词（如 `/sd vocab 沙滩泳装`）可预览检索命中片段。词库文件由本地维护，生图时按描述关键词自动检索相关片段注入 LLM。",
+            "- `/sd vocab`：查看标准词库状态；附带描述（如 `/sd vocab 沙滩泳装`）可预览 embedding 语义检索命中片段。",
+            "- `/sd embedding status`：查看词库向量索引状态。",
+            "- `/sd embedding provider [ID]`：列出或切换 AstrBot Embedding 提供商。",
+            "- `/sd embedding rebuild`：在后台强制重建词库向量索引。",
             "- `/sd timeout [秒数]`：设置连接超时时间（建议范围：10 到 1800 秒）。",
             "- `/sd res  [宽度] [高度]`：设置图像生成的分辨率（高度和宽度均支持:1-2048之间的任意整数）。",
             "- `/sd step [步数]`：设置图像生成的步数（范围：10 到 50 步）。",
@@ -1464,7 +1528,7 @@ class SDGenerator(Star):
             "",
             "ℹ️ **注意事项**:",
             "- 如启用自动生成提示词功能，则会使用 LLM 利用提供的内容来生成提示词。",
-            "- 如未启用自动生成提示词功能，若提供的自定义提示词中包含空格，则应使用 “~”（英文波浪号） 替代所有提示词中的空格，否则输入的自定义提示词组将在空格处中断。你可以在配置中修改想使用的字符。",
+            "- 提示词可以直接包含空格、英文逗号和 Danbooru tags，无需使用特殊字符替代空格。",
             "- 模型、采样器和其他资源的索引需要使用对应 `list` 命令获取后设置！",
         ]
         yield event.plain_result("\n".join(help_msg))
@@ -1878,13 +1942,15 @@ class SDGenerator(Star):
         or produce an image or illustration (e.g. "画一张", "生成图片", "draw a girl",
         "make an anime cover"). Do NOT call it for image searching, viewing, or uploading.
 
-        The prompt should be a detailed English description in Danbooru-tag style:
-        comma-separated tags covering subject, character, outfit, pose, scene, lighting,
-        and style. Resolution, sampler and other parameters are controlled by the plugin
-        config, so do not include resolution or quality keywords.
+        The prompt must describe only the desired visible content. Use concise English,
+        comma-separated Danbooru-style tags covering subject, appearance, clothing, pose,
+        composition, environment, lighting, color and visual style. Keep character names
+        and franchise names when relevant. Do not include chat commentary, tool instructions,
+        image dimensions, sampler settings, LoRA syntax or negative prompts; those are managed
+        by the plugin configuration.
 
         Args:
-            prompt (string): Detailed English tag-style description for the image.
+            prompt (string): English comma-separated tags describing the requested image.
         """
         try:
             # 使用 async for 遍历异步生成器的返回值

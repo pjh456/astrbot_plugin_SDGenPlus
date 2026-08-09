@@ -212,7 +212,7 @@
         "type": "string",
         "description": "标准词库文件路径",
         "default": "data/sdgen/prompt_vocabulary.txt",
-        "hint": "插件会读取此文件内容作为标准词库，在 LLM 生成提示词时按用户描述关键词检索相关片段并注入，让 LLM 按照词库规范组合词条。文件不存在或为空时不使用词库。可填绝对路径或相对路径（相对 AstrBot 运行目录）。"
+        "hint": "插件会读取此文件作为标准词库，在 LLM 生成提示词时使用 embedding 语义相似度检索相关片段并注入。文件不存在或为空时跳过词库；可填绝对路径或相对 AstrBot 运行目录的路径。"
     },
 
     "prompt_vocabulary_top_k": {
@@ -237,7 +237,7 @@
         "type": "bool",
         "description": "启用词库向量检索（embedding）",
         "default": true,
-        "hint": "启用后，LLM 生成提示词时将从标准词库检索最相关片段注入（按语义相似度，不再依赖关键词匹配）。需要选择模型提供商并确认其支持 embeddings 接口。关闭后跳过词库注入。"
+        "hint": "启用后，在 LLM 生成提示词时从标准词库按语义相似度检索相关片段。优先使用 AstrBot 已配置的 Embedding 提供商；不可用时跳过词库注入，不影响普通生图，也不会回退到字符串关键词匹配。"
     },
 
     "embedding_provider_id": {

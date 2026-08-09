@@ -1,6 +1,6 @@
 name: astrbot_plugin_SDGenPlus
-desc: 用于astrbot，使用Stable Diffusion WebUI的API进行图片生成的插件。集成神秘法典标准词库embedding语义检索注入LLM，支持SDXL/SD3/FLUX/Pony/NoobAI/Illustrious等新模型参数，支持默认LoRA自动注入。
-help: 输入 /sd help 查看全部指令。/sd preset <名称> 一键切换新模型预设，/sd vocab 查看标准词库，/sd embedding status 查看向量检索状态，/sd lora set <名字> [权重] 设置默认LoRA。
+desc: Stable Diffusion WebUI 生图增强插件，支持神秘法典词库 Embedding 语义检索、默认 LoRA 注入、LLM 工具调用和 SDXL/SD3/FLUX/Pony/NoobAI/Illustrious 参数预设。
+help: 使用 /sd help 查看完整指令；/sd gen <提示词> 生图，/sd embedding status 查看词库索引，/sd lora set <名称> [权重] 设置默认 LoRA。
 version: v1.0.0
 author: xiongxiong
 repo: https://github.com/xiongxiong1314-neko/astrbot_plugin_SDGenPlus
