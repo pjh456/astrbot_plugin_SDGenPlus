@@ -5,7 +5,7 @@
 - 插件名称：`astrbot_plugin_SDGenPlus`
 - 显示名称：`SDGenPlus（Stable Diffusion 生图）`
 - 作者：`xiongxiong`
-- 当前版本：`v1.0.0`
+- 当前版本：`v1.0.1`
 - 仓库地址：https://github.com/xiongxiong1314-neko/astrbot_plugin_SDGenPlus
 - 插件分类：工具 / 图片生成（建议标签：`plugin-cate:tooling`）
 - 是否支持配置：是，提供 `_conf_schema.json`

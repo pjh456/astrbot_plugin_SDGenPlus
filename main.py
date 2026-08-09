@@ -35,7 +35,7 @@ EMBEDDING_DEFAULT_MODELS = {
     "aihubmix_chat_completion": "text-embedding-3-small",
 }
 
-@register("SDGenPlus", "xiongxiong", "Stable Diffusion图像生成器(集成标准词库+新模型支持)", "1.0.0")
+@register("SDGenPlus", "xiongxiong", "Stable Diffusion图像生成器(集成标准词库+新模型支持)", "1.0.1")
 class SDGenerator(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
