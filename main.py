@@ -35,7 +35,7 @@ EMBEDDING_DEFAULT_MODELS = {
     "aihubmix_chat_completion": "text-embedding-3-small",
 }
 
-@register("SDGenPlus", "xiongxiong", "Stable Diffusion图像生成器(集成标准词库+新模型支持)", "1.0.1")
+@register("SDGenPlus", "xiongxiong", "Stable Diffusion图像生成器(集成标准词库+新模型支持)", "1.0.2")
 class SDGenerator(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -550,7 +550,7 @@ class SDGenerator(Star):
             if "embed" in str(k).lower() and isinstance(v, str) and v.strip():
                 return v.strip()
         ptype = str(pcfg.get("type") or "")
-        return self.EMBEDDING_DEFAULT_MODELS.get(ptype, "")
+        return EMBEDDING_DEFAULT_MODELS.get(ptype, "")
 
     def _embedding_provider_key(self, provider, api_base: str, model: str) -> str:
         """生成缓存失效用的提供商标识：原生 embedding provider 用 type|id|model，兼容路径再加 api_base。"""
@@ -576,7 +576,7 @@ class SDGenerator(Star):
             try:
                 if batch_method is not None:
                     return await batch_method(
-                        texts, batch_size=self.EMBEDDING_BATCH_SIZE
+                        texts, batch_size=EMBEDDING_BATCH_SIZE
                     )
                 return await provider.get_embeddings(texts)
             except Exception as e:
@@ -619,8 +619,8 @@ class SDGenerator(Star):
         """分批向量化，避免单次请求过大。"""
         results: list[list[float]] = []
         total = len(texts)
-        for i in range(0, total, self.EMBEDDING_BATCH_SIZE):
-            chunk = texts[i:i + self.EMBEDDING_BATCH_SIZE]
+        for i in range(0, total, EMBEDDING_BATCH_SIZE):
+            chunk = texts[i:i + EMBEDDING_BATCH_SIZE]
             vecs = await self._embed_texts(chunk)
             if vecs is None:
                 raise RuntimeError(self._embed_error or "embedding 请求失败")
@@ -641,9 +641,9 @@ class SDGenerator(Star):
 
     def _load_embedding_cache(self) -> dict | None:
         try:
-            if not os.path.exists(self.EMBEDDING_CACHE_FILE):
+            if not os.path.exists(EMBEDDING_CACHE_FILE):
                 return None
-            with open(self.EMBEDDING_CACHE_FILE, "r", encoding="utf-8") as f:
+            with open(EMBEDDING_CACHE_FILE, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception as e:
             logger.warning(f"读取词库向量缓存失败: {e}")
@@ -651,11 +651,11 @@ class SDGenerator(Star):
 
     def _save_embedding_cache(self, data: dict) -> None:
         try:
-            os.makedirs(self.EMBEDDING_CACHE_DIR, exist_ok=True)
-            tmp = self.EMBEDDING_CACHE_FILE + ".tmp"
+            os.makedirs(EMBEDDING_CACHE_DIR, exist_ok=True)
+            tmp = EMBEDDING_CACHE_FILE + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False)
-            os.replace(tmp, self.EMBEDDING_CACHE_FILE)
+            os.replace(tmp, EMBEDDING_CACHE_FILE)
         except Exception as e:
             logger.warning(f"保存词库向量缓存失败: {e}")
 
@@ -880,7 +880,11 @@ class SDGenerator(Star):
                 prompt_generate_text += f"\n{prompt_guidelines}\n"
             prompt_generate_text += "描述："
 
-            response = await provider.text_chat(f"{prompt_generate_text} {prompt}", session_id=None)
+            try:
+                response = await provider.text_chat(f"{prompt_generate_text} {prompt}", session_id=None)
+            except Exception as e:
+                logger.error(f"LLM 生成提示词失败，回退使用原始提示词: {e}")
+                return ""
             if response.completion_text:
                 generated_prompt = re.sub(r"<think>[\s\S]*</think>", "", response.completion_text).strip()
                 return generated_prompt
