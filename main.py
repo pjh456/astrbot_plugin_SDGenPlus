@@ -35,7 +35,7 @@ EMBEDDING_DEFAULT_MODELS = {
     "aihubmix_chat_completion": "text-embedding-3-small",
 }
 
-@register("SDGenPlus", "xiongxiong", "Stable Diffusion图像生成器(集成标准词库+新模型支持)", "1.0.2")
+@register("SDGenPlus", "xiongxiong", "Stable Diffusion图像生成器(集成标准词库+新模型支持)", "1.0.3")
 class SDGenerator(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -1049,10 +1049,10 @@ class SDGenerator(Star):
     ):
         """Shared image generation logic for command/tool callers.
 
-        AstrBot 当前稳定版（v4.27.3）会包裹 `@llm_tool` 的异步生成器并只保留**最后**一个
-        yield（`_PermissionGuardedTool.call`）。因此工具路径（for_tool=True）只 yield
-        最终结果（图片），不 yield 任何过程提示/成功文字，否则图片会被"最后一条
-        提示词"顶掉而丢失。
+        工具路径（for_tool=True）下 `generate_image_tool` 直接 `event.send` 发送图片，
+        仅向 LLM 返回一段纯文本结果（避免 ImageContent 路径的 tool_image_cache 落盘
+        与 core 的"直发"warning）。因此该路径不 yield 过程提示/成功文字，防止其
+        污染最终交给 LLM 的文本结果。
         """
         async with self.task_semaphore:
             self.active_tasks += 1
@@ -1964,8 +1964,11 @@ class SDGenerator(Star):
         Args:
             prompt (string): English comma-separated tags describing the requested image.
         """
+        sent_image = False
+        final_text = ""
         try:
-            # 使用 async for 遍历异步生成器的返回值
+            # 图片直接 event.send 发送：不落 tool_image_cache 磁盘缓存，
+            # 也不触发 core 对"直发"路径的 warning；最终只向 LLM 返回一段文本
             async for result in self._run_generate_image(
                 event,
                 prompt,
@@ -1973,9 +1976,23 @@ class SDGenerator(Star):
                 allow_extract_prompt=False,
                 for_tool=True
             ):
-                # 根据生成器的每一个结果返回响应
-                yield result
-
+                chain = getattr(result, "chain", None) or []
+                images = [c for c in chain if isinstance(c, Image)]
+                if images:
+                    await event.send(MessageChain(chain=images))
+                    sent_image = True
+                    continue
+                final_text = "".join(
+                    c.text for c in chain if isinstance(c, Plain)
+                )
         except Exception as e:
             logger.error(f"调用 generate_image 时出错: {e}")
-            yield event.plain_result("❌ 图像生成失败，请检查日志")
+            final_text = "Image generation failed. The error has been logged on the server."
+
+        if sent_image:
+            yield (
+                "Image generated and sent to the user successfully. "
+                "Do not send the image again; you may add a short caption."
+            )
+        else:
+            yield final_text or "Image generation failed with no details."
