@@ -46,6 +46,9 @@ git clone https://github.com/xiongxiong1314-neko/astrbot_plugin_SDGenPlus.git
 ```text
 astrbot_plugin_SDGenPlus/
 ├── main.py
+├── prompt_engine.py
+├── vocab_embedding.py
+├── webui_client.py
 ├── _conf_schema.json
 ├── metadata.yaml
 ├── requirements.txt
@@ -156,6 +159,21 @@ images: list[str] = await sd.generate("a cat on the roof")
 - 失败时抛出异常由调用方处理：`ValueError`（提示词为空、API 返回异常）、`WebUIUnavailableError`/`ConnectionError`（WebUI 未连接或 API 错误）、`TimeoutError`（请求超时）。
 - `star_map` 是 AstrBot 内部 API（非 `astrbot.api` 公开 SDK），升级 AstrBot 大版本后需确认仍可用；调用前务必判空。
 - 插件加载顺序不作保证，建议在 `on_astrbot_loaded` 之后或首次调用失败时重试获取实例。
+
+## 内部结构
+
+v1.1.1 起，插件主体拆分为 4 个文件（纯结构重构，行为不变）：
+
+| 文件 | 职责 |
+| --- | --- |
+| `main.py` | 入口与编排层：`/sd` 指令处理器、`generate_image` LLM 工具、`generate` 服务方法、并发控制与卸载清理 |
+| `webui_client.py` | `WebUIClient`：独占共享 aiohttp 会话，集中全部 `/sdapi` 调用（资源列表、txt2img、超分、切换模型、健康检查）；`WebUIUnavailableError` 定义于此 |
+| `prompt_engine.py` | `PromptEngine`：正/负面提示词构建、全局预设（头部/尾部）、默认 LoRA 注入、LLM 提示词增强（含词库注入） |
+| `vocab_embedding.py` | `VocabEmbedding`：标准词库文件解析、embedding 提供商解析、向量索引构建/缓存（按提供商/模型/词库 mtime 自动失效）、top-k 语义检索、后台构建任务管理 |
+
+依赖方向单向：`main.py` → `prompt_engine.py` → `vocab_embedding.py`，`main.py` → `webui_client.py`，无循环依赖。
+
+插件目录是 AstrBot 的 namespace package（以 `data.plugins.<目录名>.main` 导入），四个文件通过相对导入（`from .webui_client import ...`）互相引用，无需 `__init__.py`。
 
 ## 主要配置
 
