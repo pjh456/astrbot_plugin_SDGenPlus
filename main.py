@@ -35,7 +35,12 @@ EMBEDDING_DEFAULT_MODELS = {
     "aihubmix_chat_completion": "text-embedding-3-small",
 }
 
-@register("SDGenPlus", "xiongxiong", "Stable Diffusion图像生成器(集成标准词库+新模型支持)", "1.0.3")
+
+class WebUIUnavailableError(ConnectionError):
+    """SD WebUI 未连接或不可用。"""
+
+
+@register("SDGenPlus", "xiongxiong", "Stable Diffusion图像生成器(集成标准词库+新模型支持)", "1.1.0")
 class SDGenerator(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -1039,6 +1044,59 @@ class SDGenerator(Star):
             logger.error(f"❌ 检查可用性错误，报错{e}")
             yield event.plain_result("❌ 检查可用性错误，请检查日志")
 
+    async def _prepare_prompt(self, prompt: str, enhance_prompt: bool = False) -> str:
+        """构建正面提示词（含可选 LLM 增强与 LoRA 注入）。"""
+        generated_prompt = ""
+        if enhance_prompt and self.config.get("enable_generate_prompt"):
+            generated_prompt = await self._generate_prompt(prompt)
+            logger.debug(f"LLM generated prompt: {generated_prompt}")
+        return self._build_positive_prompt(prompt, generated_prompt)
+
+    async def _render_images(self, positive_prompt: str) -> list[str]:
+        """调用 SD WebUI API 生成图像并完成超分后处理，返回 base64 数据列表。"""
+        response = await self._call_t2i_api(positive_prompt)
+        if not response.get("images"):
+            raise ValueError("API返回数据异常：生成图像失败")
+        images = response["images"]
+        if self.config.get("enable_upscale"):
+            images = [await self._apply_image_processing(img) for img in images]
+        return images
+
+    async def _generate_images(self, prompt: str, enhance_prompt: bool = False) -> list[str]:
+        """纯生成核心，不依赖消息事件。
+
+        供内部复用与对外插件调用（见 `generate`）；
+        失败时抛出原始异常（ValueError/ConnectionError/TimeoutError 等）。
+        """
+        prompt = (prompt or "").strip()
+        if not prompt:
+            raise ValueError("需要提供提示词")
+        if not (await self._check_webui_available())[0]:
+            raise WebUIUnavailableError("同webui无连接，目前无法生成图片！")
+        positive_prompt = await self._prepare_prompt(prompt, enhance_prompt)
+        return await self._render_images(positive_prompt)
+
+    async def generate(self, prompt: str, enhance_prompt: bool = False) -> list[str]:
+        """供其他插件调用的生图服务方法。
+
+        不依赖消息事件、不发送任何消息、不写磁盘；
+        失败时抛出原始异常（ValueError/ConnectionError/TimeoutError 等），由调用方处理。
+        与指令/LLM 工具路径共享任务并发限制。
+
+        Args:
+            prompt: 图像描述（正面提示词）；为空时抛出 ValueError。
+            enhance_prompt: 是否先用 LLM 增强提示词（受 enable_generate_prompt 配置约束）。
+
+        Returns:
+            list[str]: base64 格式的图片数据列表（数量与生成图像数一致）。
+        """
+        async with self.task_semaphore:
+            self.active_tasks += 1
+            try:
+                return await self._generate_images(prompt, enhance_prompt)
+            finally:
+                self.active_tasks -= 1
+
     async def _run_generate_image(
         self,
         event: AstrMessageEvent,
@@ -1073,88 +1131,55 @@ class SDGenerator(Star):
                 if verbose:
                     yield event.plain_result("🖌️ 生成图像阶段，这可能需要一段时间...")
 
-                # 生成正面提示词，决定到底是使用LLM生成还是用户直接提供
-                generated_prompt = ""
-                if allow_generate_prompt and self.config.get("enable_generate_prompt"):
-                    generated_prompt = await self._generate_prompt(prompt)
-                    logger.debug(f"LLM generated prompt: {generated_prompt}")
+                try:
+                    positive_prompt = await self._prepare_prompt(
+                        prompt, allow_generate_prompt
+                    )
 
-                positive_prompt = self._build_positive_prompt(prompt, generated_prompt)
-
-                #输出正面提示词
-                if self.config.get("enable_show_positive_prompt", False) and not for_tool:
-                    yield event.plain_result(f"正面提示词：{positive_prompt}")
-
-                # 生成图像
-                response = await self._call_t2i_api(positive_prompt)
-                if not response.get("images"):
-                    raise ValueError("API返回数据异常：生成图像失败")
-
-                images = response["images"]
-
-                if len(images) == 1:
-
-                    image_data = response["images"][0]
-
-                    image = image_data
-
-                    # 图像处理
-                    if self.config.get("enable_upscale"):
-                        if verbose:
-                            yield event.plain_result("🖼️ 处理图像阶段，即将结束...")
-                        image = await self._apply_image_processing(image)
-
-                    yield event.chain_result([Image.fromBase64(image)])
-                else:
-                    chain = []
-
-                    if self.config.get("enable_upscale") and verbose:
+                    #输出正面提示词
+                    if self.config.get("enable_show_positive_prompt", False) and not for_tool:
+                        yield event.plain_result(f"正面提示词：{positive_prompt}")
+                    if verbose and self.config.get("enable_upscale"):
                         yield event.plain_result("🖼️ 处理图像阶段，即将结束...")
 
-                    for image_data in images:
-                        image = image_data
+                    images = await self._render_images(positive_prompt)
 
-                        # 图像处理
-                        if self.config.get("enable_upscale"):
-                            image = await self._apply_image_processing(image)
+                except ValueError as e:
+                    # 针对API返回异常的处理
+                    logger.error(f"API返回数据异常: {e}")
+                    yield event.plain_result(f"❌ 图像生成失败: 参数异常，API调用失败")
+                    return
 
-                        # 添加到链对象
-                        chain.append(Image.fromBase64(image))
+                except ConnectionError as e:
+                    # 网络连接错误处理
+                    msg = str(e)
+                    logger.error(f"网络连接失败: {msg}")
+                    if "sampler" in msg.lower():
+                        yield event.plain_result(
+                            "⚠️ 生成失败: 采样器不兼容当前模型\n"
+                            "请用 `/sd sampler list` 查看可用采样器，`/sd sampler set [索引]` 切换\n"
+                            "提示: SD3/FLUX 通常需用 Euler/Euler a；SDXL 可用 DPM++ 2M Karras"
+                        )
+                    else:
+                        yield event.plain_result("⚠️ 生成失败! 请检查网络连接和WebUI服务是否运行正常")
+                    return
 
-                    # 将链式结果发送给事件
-                    yield event.chain_result(chain)
+                except TimeoutError as e:
+                    # 处理超时错误
+                    logger.error(f"请求超时: {e}")
+                    yield event.plain_result("⚠️ 请求超时，请稍后再试")
+                    return
 
-                # 工具路径下不 yield 成功文字，确保图片是最后一个 yield
+                except Exception as e:
+                    # 捕获所有其他异常
+                    logger.error(f"生成图像时发生其他错误: {e}")
+                    yield event.plain_result(f"❌ 图像生成失败: 发生其他错误，请检查日志")
+                    return
+
+                # 先发图片结果，再发成功文字（工具路径 verbose 恒为 False，只发图片）
+                yield event.chain_result([Image.fromBase64(img) for img in images])
                 if verbose:
                     yield event.plain_result("✅ 图像生成成功")
-
-            except ValueError as e:
-                # 针对API返回异常的处理
-                logger.error(f"API返回数据异常: {e}")
-                yield event.plain_result(f"❌ 图像生成失败: 参数异常，API调用失败")
-
-            except ConnectionError as e:
-                # 网络连接错误处理
-                msg = str(e)
-                logger.error(f"网络连接失败: {msg}")
-                if "sampler" in msg.lower():
-                    yield event.plain_result(
-                        "⚠️ 生成失败: 采样器不兼容当前模型\n"
-                        "请用 `/sd sampler list` 查看可用采样器，`/sd sampler set [索引]` 切换\n"
-                        "提示: SD3/FLUX 通常需用 Euler/Euler a；SDXL 可用 DPM++ 2M Karras"
-                    )
-                else:
-                    yield event.plain_result("⚠️ 生成失败! 请检查网络连接和WebUI服务是否运行正常")
-
-            except TimeoutError as e:
-                # 处理超时错误
-                logger.error(f"请求超时: {e}")
-                yield event.plain_result("⚠️ 请求超时，请稍后再试")
-
-            except Exception as e:
-                # 捕获所有其他异常
-                logger.error(f"生成图像时发生其他错误: {e}")
-                yield event.plain_result(f"❌ 图像生成失败: 发生其他错误，请检查日志")
             finally:
                 self.active_tasks -= 1
 

@@ -132,6 +132,31 @@ chibi:0.8, detail_slider:0.5
 
 完整指令请使用 `/sd help`。
 
+## 供其他插件调用
+
+插件提供 `generate` 服务方法，可在其他 AstrBot 插件中直接调用来生图：
+
+```python
+from astrbot.core.star.star import star_map
+
+# 模块 key 由本插件 metadata.yaml 的 name 字段决定
+meta = star_map.get("data.plugins.astrbot_plugin_SDGenPlus.main")
+sd = meta and meta.star_cls
+if not sd:
+    raise RuntimeError("SDGenPlus 插件未加载或已禁用")
+
+# 返回 base64 图片数据列表（数量与生成图像数一致）；
+# enhance_prompt=True 可先用 LLM 增强提示词（受 enable_generate_prompt 配置约束）
+images: list[str] = await sd.generate("a cat on the roof")
+```
+
+说明与限制：
+
+- `generate` 不依赖消息事件、不发送消息、不写磁盘，并与指令/LLM 工具路径共享 `max_concurrent_tasks` 并发限制。
+- 失败时抛出异常由调用方处理：`ValueError`（提示词为空、API 返回异常）、`WebUIUnavailableError`/`ConnectionError`（WebUI 未连接或 API 错误）、`TimeoutError`（请求超时）。
+- `star_map` 是 AstrBot 内部 API（非 `astrbot.api` 公开 SDK），升级 AstrBot 大版本后需确认仍可用；调用前务必判空。
+- 插件加载顺序不作保证，建议在 `on_astrbot_loaded` 之后或首次调用失败时重试获取实例。
+
 ## 主要配置
 
 | 配置项 | 默认值 | 说明 |
