@@ -19,12 +19,13 @@ TEMP_PATH = os.path.abspath("data/temp")
 PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
-@register("SDGenPlus", "xiongxiong", "Stable Diffusion图像生成器(集成标准词库+新模型支持)", "1.1.1")
+@register("SDGenPlus", "xiongxiong", "Stable Diffusion图像生成器(集成标准词库+新模型支持)", "1.2.0")
 class SDGenerator(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
         self._validate_config()
+        self._migrate_legacy_global_prompt()
         os.makedirs(TEMP_PATH, exist_ok=True)
 
         # 初始化并发控制
@@ -52,6 +53,45 @@ class SDGenerator(Star):
         if self.config["webui_url"].endswith("/"):
             self.config["webui_url"] = self.config["webui_url"].rstrip("/")
             self.config.save_config()
+
+    def _migrate_legacy_global_prompt(self):
+        """把旧版「全局正面提示词」单字段自动迁移到新的「尾部」字段。
+
+        旧字段 global_positive_prompt 仍保留在 _conf_schema.json 中（已废弃）：
+        AstrBot 加载配置时会丢弃 schema 中不存在的旧 key，只有留在 schema 里，
+        旧值才能在升级时存活到插件代码。
+
+        迁移规则：旧值非空时写入「尾部」字段（旧版默认位置就是尾部）；
+        仅在新字段为空时写入（不覆盖用户已手动设置的新配置）；
+        随后清空旧字段并保存。幂等、只生效一次。
+        """
+        try:
+            group = self.config.get("global_prompt_group")
+            if not isinstance(group, dict):
+                return
+            legacy_raw = group.get("global_positive_prompt")
+            if legacy_raw is None:
+                return
+            legacy_text = str(legacy_raw).strip()
+
+            changed = False
+            if legacy_text and not (group.get("global_positive_prompt_tail") or "").strip():
+                group["global_positive_prompt_tail"] = legacy_text
+                changed = True
+                logger.info(f"已将旧版全局正面提示词迁移到新的「尾部」字段: {legacy_text}")
+            elif legacy_text:
+                logger.warning(
+                    f"新的「尾部」字段已有值，旧版全局正面提示词未迁移: {legacy_text}"
+                )
+
+            if legacy_raw != "":
+                group["global_positive_prompt"] = ""
+                changed = True
+
+            if changed:
+                self.config.save_config()
+        except Exception as e:
+            logger.error(f"迁移旧版全局正面提示词配置失败: {e}")
 
     async def terminate(self):
         """插件卸载时释放后台任务、HTTP 会话与兼容 embedding 客户端。"""
@@ -210,9 +250,9 @@ class SDGenerator(Star):
 
     def _get_generation_params(self) -> str:
         """获取当前图像生成的参数"""
-        global_positive_prompt_switch = self.config.get("global_prompt_group").get("global_positive_prompt_switch", False)  # 获取全局正面提示词开关状态
+        global_positive_prompt_head = self.config.get("global_prompt_group").get("global_positive_prompt_head", "")  # 全局正面提示词（头部）
+        global_positive_prompt_tail = self.config.get("global_prompt_group").get("global_positive_prompt_tail", "")  # 全局正面提示词（尾部）
         global_negative_prompt_switch = self.config.get("global_prompt_group").get("global_negative_prompt_switch", False)  # 获取全局负面提示词开关状态
-        global_positive_prompt = self.config.get("global_prompt_group").get("global_positive_prompt", "") # 获取全局正面提示词
         global_negative_prompt = self.config.get("global_prompt_group").get("global_negative_prompt", "")   #获取全局负面提示词
 
         params = self.config.get("default_params", {})
@@ -229,8 +269,8 @@ class SDGenerator(Star):
         lora_display = ", ".join(lora_tags) if lora_tags else "未设置"
 
         return (
-            f"- 全局正面提示词: {'开启' if global_positive_prompt_switch else '关闭'}\n"
-            f"- 全局正面提示词: {global_positive_prompt}\n"
+            f"- 全局正面提示词(头部): {global_positive_prompt_head or '未设置'}\n"
+            f"- 全局正面提示词(尾部): {global_positive_prompt_tail or '未设置'}\n"
             f"- 全局负面提示词: {'开启' if global_negative_prompt_switch else '关闭'}\n"
             f"- 全局负面提示词: {global_negative_prompt}\n"
             f"- 上次插件设置模型: {base_model}\n"
@@ -332,21 +372,6 @@ class SDGenerator(Star):
             event, self.config, "enable_generate_prompt", "提示词生成功能"
         ):
             yield result
-
-    @sd.command("headtail") # 切换全局正面提示词添加位置
-    async def switch_positive_prompt_add_in_head_or_tail(self, event: AstrMessageEvent):
-        """切换全局正面提示词添加位置"""
-        try:
-            current_setting = self.config.get("global_prompt_group").get("positive_prompt_add_in_head_or_tail_switch", False)
-            new_setting = not current_setting
-            self.config["global_prompt_group"]["positive_prompt_add_in_head_or_tail_switch"] = new_setting
-            self.config.save_config()
-
-            status = "头部" if new_setting else "尾部"
-            yield event.plain_result(f"📢 全局正面提示词现将添加在 {status}")
-        except Exception as e:
-            logger.error(f"切换全局正面提示词位置失败: {e}")
-            yield event.plain_result("❌ 切换全局正面提示词位置失败，请检查日志")
 
     @sd.command("prompt") # 切换显示正面提示词功能
     async def set_show_prompt(self, event: AstrMessageEvent):
@@ -510,10 +535,7 @@ class SDGenerator(Star):
     async def show_conf(self, event: AstrMessageEvent):
         """打印当前图像生成参数，包括当前使用的模型"""
         try:
-            global_positive_prompt_switch = self.config.get("global_prompt_group").get("global_positive_prompt_switch", False)  # 获取全局正面提示词开关状态
-            global_negative_prompt_switch = self.config.get("global_prompt_group").get("global_negative_prompt_switch", False)  # 获取全局负面提示词开关状态
-
-            gen_params = self._get_generation_params()  # 获取当前图像参数
+            gen_params = self._get_generation_params()  # 获取当前图像参数（含全局正负提示词展示）
             scale_params = self._get_upscale_params()   # 获取图像增强参数
             prompt_guidelines = self.config.get("prompt_guidelines").strip() or "未设置"  # 获取提示词限制
 
@@ -526,8 +548,6 @@ class SDGenerator(Star):
             refiner_ckpt = (new_params.get("refiner_checkpoint") or "").strip() or "未设置"
             refiner_switch = new_params.get("refiner_switch_at", 0.8)
             current_model, current_vae = await self.webui.get_model_info()
-
-            positive_prompt_add_in_head_or_tail_switch = self.config.get("global_prompt_group").get('positive_prompt_add_in_head_or_tail_switch',False) # 获取全局正面提示词添加位置
 
             verbose = self.config.get("verbose", True)  # 获取详略模式
             upscale = self.config.get("enable_upscale", False)  # 图像增强模式
@@ -542,7 +562,6 @@ class SDGenerator(Star):
                 f"- CLIP跳过: {clip_skip}\n"
                 f"- Refiner模型: {refiner_ckpt}\n"
                 f"- Refiner切换: {refiner_switch}\n\n"
-                f"⬅️➡️  全局正面提示词加在 {'头部' if positive_prompt_add_in_head_or_tail_switch else '尾部'}\n\n"
                 f"🔍  图像增强参数:\n{scale_params}\n\n"
                 f"🛠️  提示词附加要求: {prompt_guidelines}\n\n"
                 f"📚  标准词库路径: {prompt_vocabulary_path}\n\n"
@@ -571,8 +590,8 @@ class SDGenerator(Star):
             "- `/sd conf`：显示当前使用配置，包括模型、参数和提示词设置。",
             "- `/sd help`：显示本帮助信息。",
             "",
-            "➕➖ **正负提示词设置指令**:",
-            "- `/sd headtail`：切换全局正面提示词添加位置（头部或尾部）。",
+            "➕➖ **正负提示词设置**:",
+            "- 全局正面提示词（头部/尾部）与全局负面提示词在 AstrBot 插件配置页设置；正面提示词某侧留空即不添加该侧。",
             "",
             "🔧 **高级功能指令**:",
             "- `/sd verbose`：切换详细输出模式，用于实时告知目前AI生图进行到了哪个阶段。",

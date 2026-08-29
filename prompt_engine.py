@@ -103,23 +103,19 @@ class PromptEngine:
         return fallback or base
 
     def build_positive_prompt(self, raw_prompt: str, generated_prompt: str) -> str:
-        """Construct final positive prompt with global preset."""
-        global_group = self.config.get("global_prompt_group", {})
+        """Construct final positive prompt with global preset.
 
-        global_positive_prompt = (
-            global_group.get("global_positive_prompt", "")
-            if global_group.get("global_positive_prompt_switch", False)
-            else ""
-        )
-        add_global_first = global_group.get("positive_prompt_add_in_head_or_tail_switch", False)
+        全局正面提示词分为头部/尾部两个独立输入项，留空即不添加该侧，二者可同用。
+        """
+        global_group = self.config.get("global_prompt_group", {})
+        head = (global_group.get("global_positive_prompt_head") or "").strip()
+        tail = (global_group.get("global_positive_prompt_tail") or "").strip()
 
         base_prompt = (
             generated_prompt if self.config.get("enable_generate_prompt") and generated_prompt else self.trans_prompt(raw_prompt)
         )
 
-        if add_global_first:
-            return compose_prompt(global_positive_prompt, base_prompt)
-        return compose_prompt(base_prompt, global_positive_prompt)
+        return compose_prompt(head, base_prompt, tail)
 
     async def prepare(self, prompt: str, enhance_prompt: bool = False) -> str:
         """构建正面提示词（含可选 LLM 增强与 LoRA 注入）。"""

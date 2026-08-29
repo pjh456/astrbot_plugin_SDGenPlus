@@ -54,26 +54,19 @@
         "hint": "全局提示词仅可在此UI界面中设置，它们会自动附加到所有AI生图请求的提示词词组中，且无法利用指令关闭，来防止生成不该生成的图片，如果不需要，可以在此关闭。",
         "items": {
 
-            "global_positive_prompt_switch": {
-                "type": "bool",
-                "description": "全局正面提示词开关",
-                "default": false,
-                "hint": "设置为true时启用，决定是否启用全局正面提示词"
-            },    
-
-            "positive_prompt_add_in_head_or_tail_switch": {
-            "type": "bool",
-            "description": "全局正面提示词加在头还是加在尾？",
-            "default": false,
-            "hint": "此开关设置为true时，全局正面提示词将会附着在用户输入的提示词组的开头，起到最大权重，如定义画风、设置安全等级。否则附着在尾部，权重偏低，适合用于修饰画面、提高出图质量、设定不重要的背景等。" 
+            "global_positive_prompt_head": {
+                "type": "string",
+                "description": "全局正面提示词（头部）",
+                "default": "",
+                "hint": "非空时会自动附加到所有AI生图请求提示词组的开头，权重最高，适合定义画风、设定安全等级。留空则不添加。"
             },
 
-            "global_positive_prompt": {
+            "global_positive_prompt_tail": {
                 "type": "string",
-                "description": "全局正面提示词",
+                "description": "全局正面提示词（尾部）",
                 "default": "",
-                "hint": "会自动附加到所有AI生图请求的提示词词组中"
-            },    
+                "hint": "非空时会自动附加到所有AI生图请求提示词组的末尾，权重偏低，适合修饰画面、提高出图质量、设定不重要的背景。留空则不添加。"
+            },
 
             "global_negative_prompt_switch": {
                 "type": "bool",
@@ -87,6 +80,13 @@
                 "description": "全局负面提示词",
                 "default": "(worst quality),(low quality:1.4),deformed,bad anatomy",
                 "hint": "用户只能在QQ等操作界面中只能输入正面提示词，无法输入负面提示词。所以请在这里设定全局负面提示词，它会自动附加到AI生图请求中，用于降低画面中特定的元素比例。"
+            },
+
+            "global_positive_prompt": {
+                "type": "string",
+                "description": "已废弃：旧版全局正面提示词",
+                "default": "",
+                "hint": "v1.2.0 起废弃，请勿在此设置。从旧版本升级时，插件加载会自动将旧值迁移到上方的「尾部」字段，然后自动清空此字段。"
             }
         }
     },
